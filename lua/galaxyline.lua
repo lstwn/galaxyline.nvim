@@ -1,250 +1,245 @@
-local vim = vim
-local uv = vim.loop
+local priority_queue = require("galaxyline.priority_queue")
+
 local M = {}
+
+-- TODO:
+-- 2. proper setup function
+-- 3. documentation and publish
+-- 4. tabline
+-- 5. .lua-format file
 
 M.section = {}
 M.section.left = {}
 M.section.right = {}
 M.section.mid = {}
-M.section.short_line_left = {}
-M.section.short_line_right = {}
-M.short_line_list = {}
+M.divider = {
+    provider = "%=",
+    highlight = "StatusLine",
+    priority = 9999,
+    length = 0,
+}
+M.context = nil
+M.events = {
+    "ColorScheme", "FileType", "BufWinEnter", "BufReadPost", "BufWritePost",
+    "BufEnter", "WinEnter", "FileChangedShellPost", "VimResized", "TermOpen",
+    "WinLeave",
+}
 
-_G.galaxyline_providers = {}
-
-do
-  if next(_G.galaxyline_providers) == nil then
-    require('galaxyline.provider').async_load_providers:send()
-  end
+local function log_incompatibility(component_property, invalid_type)
+    return string.format("Type '%s' not supported for property '%s'",
+        invalid_type, component_property)
 end
 
-local function check_component_exists(component_name)
-  for _,pos_value in pairs(M.section) do
-    for _,v in pairs(pos_value) do
-      if v[component_name] ~= nil then
-        return true,v[component_name]
-      end
+local function process_provider(provider, context)
+    local provider_type = type(provider)
+    if provider_type == "function" then return provider(context.user_context) end
+    if provider_type == "string" then return provider end
+    error(log_incompatibility("provider", provider_type))
+end
+
+local function process_highlight(highlight, context)
+    local function wrap_highlight_group_marker(highlight_group)
+        return "%#" .. highlight_group .. "#"
     end
-  end
-  return false,nil
-end
+    local highlight_type = type(highlight)
 
-local function exec_provider(icon,cmd)
-  local output = cmd()
-  if output == nil then return '' end
-  if string.len(icon) ~= 0 and string.len(output) ~= 0 and output then
-    return icon .. output
-  end
-  return output
-end
-
--- component decorator
--- that will output the component result with icon
--- component provider can be string or table
--- component icon can be string or function
-function M.component_decorator(component_name)
-  -- if section doesn't have component just return
-  local ok,component_info = check_component_exists(component_name)
-  if not ok then
-    print(string.format('Does not found this component: %s',component_name))
-    return
-  end
-  local provider = component_info.provider or ''
-  local icon = component_info.icon or ''
-  if type(icon) == 'function' then icon = icon() end
-  if type(icon) ~= 'string' then icon = '' end
-
-  local _switch = {
-    ['string'] = function()
-      if _G.galaxyline_providers[provider] == nil then
-        if next(_G.galaxyline_providers) ~= nil then
-          print(string.format('provider of %s does not exist in default provider group',component_name))
-          return ''
-        end
-        return ''
-      end
-      return exec_provider(icon,_G.galaxyline_providers[provider])
-    end,
-    ['function'] = function()
-      return exec_provider(icon,provider)
-    end,
-    ['table'] = function()
-      local output = ''
-      for _,v in pairs(provider) do
-        if type(v) ~= 'string' and type(v) ~= 'function' then
-          print(string.format('Wrong provider type in %s',component_name))
-          return ''
-        end
-
-        if type(v) == 'string' then
-          if type(_G.galaxyline_providers[v]) ~= 'function' then
-            if next(_G.galaxyline_providers) ~= nil then
-              print(string.format('Does not found the provider in default provider in %s',component_name))
-              return ''
-            end
-            return ''
-          end
-          output = output .. exec_provider(icon,_G.galaxyline_providers[v])
-        end
-
-        if type(v) == 'function' then
-          output = output .. exec_provider(icon,v)
-        end
-      end
-      return output
+    if highlight_type == "nil" then return "" end
+    if highlight_type == "function" then
+        return wrap_highlight_group_marker(highlight(context.user_context))
     end
-  }
-
-  local _switch_metatable = {
-    __index = function(_type)
-      return print(string.format('Type %s of provider does not support',_type))
+    if highlight_type == "string" then
+        return wrap_highlight_group_marker(highlight)
     end
-  }
-  setmetatable(_switch,_switch_metatable)
 
-  return _switch[type(provider)]()
+    error(log_incompatibility("highlight", highlight_type))
 end
 
-local function generate_section(component_name)
-  local line = ''
-  line = line .. '%#'..'Galaxy'.. component_name..'#'
-  line = line .. [[%{luaeval('require("galaxyline").component_decorator')]]..'("'..component_name..'")}'
-  return line
+local function process_formatter(formatter, resolved_provider, context)
+    local formatter_type = type(formatter)
+
+    if formatter_type == "nil" then return resolved_provider end
+    if formatter_type == "function" then
+        return formatter(resolved_provider, context.user_context)
+    end
+
+    error(log_incompatibility("formatter", formatter_type))
 end
 
-local function generate_separator_section(component_name,separator)
-  local separator_name = component_name .. 'Separator'
-  local line = ''
-  line = line .. '%#'..separator_name..'#' .. separator
-  return line
+local function process_condition(condition, context)
+    local condition_type = type(condition)
+
+    if condition_type == "nil" then return true end
+    if condition_type == "function" then
+        return condition(context.user_context)
+    end
+
+    error(log_incompatibility("condition", condition_type))
 end
 
-local function section_complete_with_option(component,component_info,position)
-  local tmp_line = ''
-  -- get the component condition and dynamicswitch
-  local condition = component_info.condition or nil
-  local separator = component_info.separator or nil
+local function process_length(length, resolved, context)
+    local length_type = type(length)
 
-  if condition then
-    if condition() then
-      tmp_line = tmp_line .. generate_section(component)
-      if separator then
-        if position == 'left' then
-          tmp_line = tmp_line .. generate_separator_section(component,separator)
+    if length_type == "nil" then return string.len(resolved) end
+    if length_type == "function" then
+        return length(string.len(resolved), context.user_context)
+    end
+    if length_type == "number" then return length end
+
+    error(log_incompatibility("length", length_type))
+end
+
+local function process_component(component, context)
+    local name = component.name
+    local priority = component.priority or 0
+    local condition = component.condition
+    local provider = component.provider
+    local length = component.length
+    local abbreviate = component.abbreviate
+    local formatter = component.formatter
+    local highlight = component.highlight
+
+    local resolved_component = {
+        name = name,
+        chopped = false,
+        raw = "",
+        formatted = "",
+        len = 0,
+        formatter = formatter,
+        abbreviate = abbreviate,
+        length = length,
+        highlighting = process_highlight(highlight, context),
+    }
+
+    if not process_condition(condition, context) then
+        return resolved_component
+    end
+
+    local raw = process_provider(provider, context)
+
+    if raw == nil then return resolved_component end
+
+    local formatted = process_formatter(formatter, raw, context)
+
+    local len = process_length(length, formatted, context)
+
+    resolved_component.raw = raw
+    resolved_component.formatted = formatted
+    resolved_component.len = len
+
+    -- only assess components that have a positive length for abbreviation/chopping
+    -- i.e., particularly no dividers!
+    if len ~= 0 then
+        context.priority_queue.enqueue(priority, resolved_component)
+    end
+    return resolved_component
+end
+
+local function process_section(section, context)
+    if section == nil then return end
+    for _, component in ipairs(section) do
+        local ok, resolved_component = pcall(function()
+            return process_component(component, context)
+        end)
+        if not ok then
+            print(string.format("Error while processing component '%s': %s",
+                component.name, resolved_component))
         else
-          tmp_line = generate_separator_section(component,separator) .. tmp_line
+            table.insert(context.component_order, resolved_component)
+            context.total_len = context.total_len + resolved_component.len
         end
-      end
     end
-    return tmp_line
-  end
-
-  tmp_line = tmp_line .. generate_section(component)
-  if separator then
-    if position == 'left' then
-      tmp_line = tmp_line .. generate_separator_section(component,separator)
-    elseif position == 'right' then
-      tmp_line = generate_separator_section(component,separator) .. tmp_line
-    else
-      if type(separator) == "table" then
-        tmp_line = generate_separator_section(component,separator[1]) ..tmp_line .. generate_separator_section(component,separator[2])
-      end
-    end
-  end
-
-  return tmp_line
+    return
 end
 
-local hi_tbl = {}
-local events = { 'ColorScheme', 'FileType','BufWinEnter','BufReadPost','BufWritePost',
-                  'BufEnter','WinEnter','FileChangedShellPost','VimResized','TermOpen'}
-
-local function load_section(section_area,pos)
-  local section = ''
-  if section_area == nil then return section end
-
-  for _,component in pairs(section_area) do
-    for component_name,component_info in pairs(component) do
-      local ls = section_complete_with_option(component_name,component_info,pos)
-      section = section .. ls
-      local group = 'Galaxy'..component_name
-      local sgroup = component_name..'Separator'
-      if not hi_tbl[group] then
-        hi_tbl[group] = component_info.highlight or {}
-      end
-      if not hi_tbl[sgroup] then
-        hi_tbl[sgroup] = component_info.separator_highlight or {}
-      end
-      if component_info.event and vim.fn.index(events,component_info.event) == -1 then
-        events[#events+1] = component_info.event
-      end
+local function prune_components(context, space_balance, columns)
+    while context.priority_queue.size() > 0 and space_balance < 0 do
+        local component = context.priority_queue.dequeue()
+        local ok, err = pcall(function()
+            local old_len
+            local new_len
+            if not component.abbreviate then
+                component.chopped = true
+                old_len = component.len
+                new_len = 0
+            else
+                local leftover_space = nil
+                if context.priority_queue.empty() then
+                    leftover_space = columns
+                end
+                component.formatted = process_formatter(component.formatter,
+                    component.abbreviate(component.raw, leftover_space), context)
+                old_len = component.len
+                new_len = process_length(component.length, component.formatted,
+                    context)
+            end
+            space_balance = space_balance + (old_len - new_len)
+        end)
+        if not ok then
+            print(string.format("Error while pruning component '%s': %s",
+                component.name, err))
+        end
     end
-  end
-  return section
 end
 
-local async_combin
-local short_line = ''
-local normal_line = ''
+-- do not add dividers multiple times (improvment with proper setup fn)
+local first_time_execution = true
 
-async_combin = uv.new_async(vim.schedule_wrap(function()
-  local left_section = load_section(M.section.left,'left')
-  local right_section = load_section(M.section.right,'right')
-  local mid_section = next(M.section.mid) ~= nil and load_section(M.section.mid,'mid') or nil
-  local short_left_section = load_section(M.section.short_line_left,'left')
-  local short_right_section = load_section(M.section.short_line_right,'right')
-  local line = ''
+function M.process_statusline()
+    local context = {
+        user_context = type(M.context) == "function" and M.context() or nil,
+        priority_queue = priority_queue(),
+        component_order = {},
+        total_len = 0,
+    }
 
-  if mid_section then
-    local fill_section = '%#GalaxylineFillSection#%='
-    line = left_section .. fill_section .. mid_section .. fill_section .. right_section
-  else
-    line = left_section .. '%=' .. right_section
-  end
-  normal_line = line
-  short_line =  short_left_section .. '%=' .. short_right_section
+    local has_mid = next(M.section.mid) ~= nil
 
-  if vim.fn.index(M.short_line_list,vim.bo.filetype) ~= -1 then
-    line = short_line
-  end
+    if first_time_execution then
+        table.insert(M.section.left, M.divider)
+        if has_mid then table.insert(M.section.mid, M.divider) end
+        first_time_execution = false
+    end
+    process_section(M.section.left, context)
+    if has_mid then process_section(M.section.mid, context) end
+    process_section(M.section.right, context)
 
-  vim.wo.statusline = line
-  M.init_colorscheme()
-end))
+    local columns = vim.fn.winwidth(0)
+    local space_balance = columns - context.total_len
+    if space_balance < 0 then
+        prune_components(context, space_balance, columns)
+    end
+
+    local statusline = ""
+    for _, resolved_component in ipairs(context.component_order) do
+        if not resolved_component.chopped then
+            statusline = statusline .. resolved_component.highlighting ..
+                             resolved_component.formatted
+        end
+    end
+    return statusline
+end
 
 function M.load_galaxyline()
-  async_combin:send()
-end
-
-function M.inactive_galaxyline()
-  if next(M.short_line_list) == nil then
-    vim.wo.statusline = normal_line
-  else
-    vim.wo.statusline = short_line
-  end
-end
-
-function M.init_colorscheme()
-  local colors = require('galaxyline.colors')
-  colors.init_theme(hi_tbl)
+    vim.wo.statusline =
+        [[%{%luaeval('require("galaxyline").process_statusline')()%}]]
 end
 
 function M.disable_galaxyline()
-  vim.wo.statusline = ''
-  vim.api.nvim_command('augroup galaxyline')
-  vim.api.nvim_command('autocmd!')
-  vim.api.nvim_command('augroup END!')
+    vim.wo.statusline = ""
+    vim.api.nvim_command("augroup galaxyline")
+    vim.api.nvim_command("autocmd!")
+    vim.api.nvim_command("augroup END!")
 end
 
 function M.galaxyline_augroup()
-  vim.api.nvim_command('augroup galaxyline')
-  vim.api.nvim_command('autocmd!')
-  for _, def in ipairs(events) do
-    local command = string.format('autocmd %s * lua require("galaxyline").load_galaxyline()',def)
-    vim.api.nvim_command(command)
-  end
-  vim.api.nvim_command('autocmd WinLeave * lua require("galaxyline").inactive_galaxyline()')
-  vim.api.nvim_command('augroup END')
+    vim.api.nvim_command("augroup galaxyline")
+    vim.api.nvim_command("autocmd!")
+    for _, def in ipairs(M.events) do
+        local command = string.format(
+            "autocmd %s * lua require(\"galaxyline\").load_galaxyline()", def)
+        vim.api.nvim_command(command)
+    end
+    vim.api.nvim_command("augroup END")
 end
 
 return M
